@@ -1,0 +1,1183 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <title>🀄 麻雀精算</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
+  <style>
+    * { -webkit-tap-highlight-color: transparent; }
+    body { 
+      overscroll-behavior: none; 
+      background: #064e3b; 
+      font-family: 'Meiryo', 'メイリオ', sans-serif;
+      font-size: 16px;
+    }
+    .tab-btn { transition: all 0.2s; }
+    .score-input { -webkit-appearance: none; -moz-appearance: textfield; }
+    .score-input::-webkit-inner-spin-button { -webkit-appearance: none; }
+    .text-xs { font-size: 0.95rem; }
+    .text-sm { font-size: 1.1rem; }
+    .text-base { font-size: 1.2rem; }
+    .text-lg { font-size: 1.4rem; }
+    .text-xl { font-size: 1.6rem; }
+    .text-2xl { font-size: 1.9rem; }
+    .sync-indicator { 
+      position: fixed; 
+      top: 10px; 
+      right: 10px; 
+      padding: 4px 8px; 
+      border-radius: 4px; 
+      font-size: 12px; 
+      z-index: 100;
+    }
+    .room-indicator {
+      position: fixed;
+      top: 10px;
+      left: 10px;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      z-index: 100;
+      background: #1f2937;
+      color: #fbbf24;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body class="bg-green-900 min-h-screen">
+  <div id="syncStatus" class="sync-indicator bg-yellow-600 text-white" style="display:none;">接続中...</div>
+  <div id="roomIndicator" class="room-indicator" style="display:none;" onclick="showRoomLogin()"></div>
+  <div id="app" class="max-w-lg mx-auto p-3 pt-10"></div>
+
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.0/firebase-app.js";
+    import { getFirestore, collection, doc, setDoc, deleteDoc, onSnapshot, writeBatch, getDoc, getDocs } from "https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore.js";
+
+    const firebaseConfig = {
+      apiKey: "AIzaSyAwyfXpzsGm66aKvH-LG8klfwtIaMqN2jE",
+      authDomain: "mahjong-score-21f84.firebaseapp.com",
+      projectId: "mahjong-score-21f84",
+      storageBucket: "mahjong-score-21f84.firebasestorage.app",
+      messagingSenderId: "144373246004",
+      appId: "1:144373246004:web:a23ab4f0f1e51e8b55c261"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const db = getFirestore(app);
+
+    const YAKUMAN_LIST = [
+      '四暗刻', '国士無双', '大三元', '字一色', '小四喜', '大四喜',
+      '緑一色', '清老頭', '九蓮宝燈', '四槓子', '天和', '地和',
+      '四暗刻単騎', '国士無双13面', '純正九蓮宝燈', 'その他'
+    ];
+
+    const DEFAULT_SETTINGS = {
+      basePoint: 30000,
+      totalPoint: 100000,
+      originPoint: 25000,
+      uma: [30, 10, -10, -30],
+      pointCoef: 100,
+      chipCoef: 100,
+      players: ['プレイヤー1', 'プレイヤー2', 'プレイヤー3', 'プレイヤー4'],
+      roomName: ''
+    };
+
+    let state = {
+      roomId: null,
+      activeTab: 'input',
+      settings: { ...DEFAULT_SETTINGS },
+      sessions: [],
+      currentSession: {
+        id: null,
+        date: new Date().toISOString().split('T')[0],
+        players: ['', '', '', ''],
+        games: [],
+        chips: [0, 0, 0, 0],
+      },
+      showSettings: false,
+    };
+
+    let unsubscribeSessions = null;
+    let unsubscribeSettings = null;
+
+    // パスワードハッシュ化（SHA-256）
+    async function hashPassword(password) {
+      const encoder = new TextEncoder();
+      const data = encoder.encode(password);
+      const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    // 部屋ID・認証情報管理
+    function getSavedRoomId() {
+      return localStorage.getItem('mj_room_id');
+    }
+
+    function getSavedAuthHash() {
+      return localStorage.getItem('mj_auth_hash');
+    }
+
+    function saveRoomAuth(roomId, authHash) {
+      localStorage.setItem('mj_room_id', roomId);
+      localStorage.setItem('mj_auth_hash', authHash);
+    }
+
+    function clearSavedRoom() {
+      localStorage.removeItem('mj_room_id');
+      localStorage.removeItem('mj_auth_hash');
+    }
+
+    function updateRoomIndicator() {
+      const el = document.getElementById('roomIndicator');
+      if (state.roomId) {
+        const displayName = state.settings.roomName || state.roomId;
+        el.textContent = `🏠 ${displayName}`;
+        el.style.display = 'block';
+      } else {
+        el.style.display = 'none';
+      }
+    }
+
+    // 部屋クリック → ログイン画面表示
+    window.showRoomLogin = () => {
+      clearSavedRoom();
+      state.roomId = null;
+      if (unsubscribeSessions) unsubscribeSessions();
+      if (unsubscribeSettings) unsubscribeSettings();
+      showLoginScreen();
+    };
+
+    // ログイン画面
+    function showLoginScreen() {
+      document.getElementById('syncStatus').style.display = 'none';
+      document.getElementById('roomIndicator').style.display = 'none';
+      const app = document.getElementById('app');
+      app.innerHTML = `
+        <div class="flex items-center justify-center min-h-screen">
+          <div class="bg-gray-800 rounded-lg p-6 w-full max-w-sm">
+            <h1 class="text-2xl font-bold text-white text-center mb-6">🀄 麻雀精算</h1>
+            
+            <div id="loginForm">
+              <div class="mb-4">
+                <label class="text-gray-300 text-sm">部屋ID</label>
+                <input id="roomIdInput" type="text" placeholder="例: GV" 
+                  class="w-full p-3 rounded bg-gray-700 text-white mt-1">
+              </div>
+              
+              <div class="mb-4">
+                <label class="text-gray-300 text-sm">パスワード</label>
+                <input id="passwordInput" type="password" placeholder="パスワード" 
+                  class="w-full p-3 rounded bg-gray-700 text-white mt-1">
+              </div>
+              
+              <button onclick="enterRoom()" class="w-full bg-green-600 text-white py-3 rounded-lg font-bold mb-3">
+                入室
+              </button>
+              
+              <div class="text-center text-gray-400 my-3">または</div>
+              
+              <button onclick="showCreateRoomForm()" class="w-full bg-blue-600 text-white py-3 rounded-lg font-bold">
+                新しい部屋を作成
+              </button>
+            </div>
+            
+            <div id="createForm" style="display:none;">
+              <div class="mb-4">
+                <label class="text-gray-300 text-sm">部屋ID（半角英数字）</label>
+                <input id="newRoomIdInput" type="text" placeholder="例: friday-mahjong" 
+                  class="w-full p-3 rounded bg-gray-700 text-white mt-1">
+                <p class="text-gray-500 text-xs mt-1">仲間に共有するIDです</p>
+              </div>
+              
+              <div class="mb-4">
+                <label class="text-gray-300 text-sm">パスワード</label>
+                <input id="newPasswordInput" type="password" placeholder="パスワード" 
+                  class="w-full p-3 rounded bg-gray-700 text-white mt-1">
+              </div>
+              
+              <div class="mb-4">
+                <label class="text-gray-300 text-sm">パスワード確認</label>
+                <input id="newPasswordConfirmInput" type="password" placeholder="パスワード確認" 
+                  class="w-full p-3 rounded bg-gray-700 text-white mt-1">
+              </div>
+              
+              <button onclick="createRoom()" class="w-full bg-green-600 text-white py-3 rounded-lg font-bold mb-3">
+                部屋を作成
+              </button>
+              
+              <button onclick="showLoginForm()" class="w-full bg-gray-600 text-white py-3 rounded-lg">
+                戻る
+              </button>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    window.showCreateRoomForm = () => {
+      document.getElementById('loginForm').style.display = 'none';
+      document.getElementById('createForm').style.display = 'block';
+    };
+
+    window.showLoginForm = () => {
+      document.getElementById('loginForm').style.display = 'block';
+      document.getElementById('createForm').style.display = 'none';
+    };
+
+    // 入室
+    window.enterRoom = async () => {
+      const roomId = document.getElementById('roomIdInput').value.trim();
+      const password = document.getElementById('passwordInput').value;
+      
+      if (!roomId) { alert('部屋IDを入力してください'); return; }
+      if (!password) { alert('パスワードを入力してください'); return; }
+      
+      try {
+        const authDoc = await getDoc(doc(db, 'groups', roomId, 'config', 'auth'));
+        
+        if (!authDoc.exists()) {
+          alert('部屋が見つかりません');
+          return;
+        }
+        
+        const hashedInput = await hashPassword(password);
+        const storedHash = authDoc.data().passwordHash;
+        
+        if (hashedInput !== storedHash) {
+          alert('パスワードが違います');
+          return;
+        }
+        
+        // 入室成功
+        saveRoomAuth(roomId, storedHash);
+        state.roomId = roomId;
+        document.getElementById('syncStatus').style.display = 'block';
+        startRealtimeSync();
+        
+      } catch (error) {
+        console.error('入室エラー:', error);
+        alert('エラーが発生しました: ' + error.message);
+      }
+    };
+
+    // 新規部屋作成
+    window.createRoom = async () => {
+      const roomId = document.getElementById('newRoomIdInput').value.trim();
+      const password = document.getElementById('newPasswordInput').value;
+      const passwordConfirm = document.getElementById('newPasswordConfirmInput').value;
+      
+      if (!roomId) { alert('部屋IDを入力してください'); return; }
+      if (!roomId.match(/^[a-zA-Z0-9_-]+$/)) { alert('部屋IDは半角英数字、ハイフン、アンダースコアのみ使用できます'); return; }
+      if (!password) { alert('パスワードを入力してください'); return; }
+      if (password.length < 4) { alert('パスワードは4文字以上にしてください'); return; }
+      if (password !== passwordConfirm) { alert('パスワードが一致しません'); return; }
+      
+      try {
+        const authDoc = await getDoc(doc(db, 'groups', roomId, 'config', 'auth'));
+        
+        if (authDoc.exists()) {
+          alert('この部屋IDは既に使用されています');
+          return;
+        }
+        
+        const hashedPassword = await hashPassword(password);
+        await setDoc(doc(db, 'groups', roomId, 'config', 'auth'), {
+          passwordHash: hashedPassword,
+          createdAt: new Date().toISOString()
+        });
+        
+        await setDoc(doc(db, 'groups', roomId, 'config', 'settings'), {
+          ...DEFAULT_SETTINGS,
+          roomName: roomId
+        });
+        
+        saveRoomAuth(roomId, hashedPassword);
+        state.roomId = roomId;
+        document.getElementById('syncStatus').style.display = 'block';
+        startRealtimeSync();
+        
+        alert(`部屋「${roomId}」を作成しました！\n\n仲間には以下を共有してください：\n部屋ID: ${roomId}\nパスワード: （設定したパスワード）`);
+        
+      } catch (error) {
+        console.error('部屋作成エラー:', error);
+        alert('エラーが発生しました: ' + error.message);
+      }
+    };
+
+    // 同期状態表示
+    function updateSyncStatus(status) {
+      const el = document.getElementById('syncStatus');
+      if (status === 'connected') {
+        el.className = 'sync-indicator bg-green-600 text-white';
+        el.textContent = '🟢 同期中';
+      } else if (status === 'syncing') {
+        el.className = 'sync-indicator bg-yellow-600 text-white';
+        el.textContent = '🔄 保存中...';
+      } else if (status === 'error') {
+        el.className = 'sync-indicator bg-red-600 text-white';
+        el.textContent = '🔴 エラー';
+      } else {
+        el.className = 'sync-indicator bg-yellow-600 text-white';
+        el.textContent = '接続中...';
+      }
+    }
+
+    // Firebase操作
+    async function saveSettingsToFirebase() {
+      if (!state.roomId) return;
+      try {
+        await setDoc(doc(db, 'groups', state.roomId, 'config', 'settings'), state.settings);
+      } catch (e) { console.error('設定保存エラー:', e); }
+    }
+
+    async function saveSessionToFirebase(session) {
+      if (!state.roomId) return;
+      try {
+        updateSyncStatus('syncing');
+        await setDoc(doc(db, 'groups', state.roomId, 'sessions', String(session.id)), session);
+        updateSyncStatus('connected');
+      } catch (e) {
+        console.error('保存エラー:', e);
+        updateSyncStatus('error');
+      }
+    }
+
+    async function deleteSessionFromFirebase(sessionId) {
+      if (!state.roomId) return;
+      try {
+        updateSyncStatus('syncing');
+        await deleteDoc(doc(db, 'groups', state.roomId, 'sessions', String(sessionId)));
+        updateSyncStatus('connected');
+      } catch (e) {
+        console.error('削除エラー:', e);
+        updateSyncStatus('error');
+      }
+    }
+
+    function startRealtimeSync() {
+      if (!state.roomId) return;
+      
+      if (unsubscribeSessions) unsubscribeSessions();
+      if (unsubscribeSettings) unsubscribeSettings();
+
+      const sessionsRef = collection(db, 'groups', state.roomId, 'sessions');
+      unsubscribeSessions = onSnapshot(sessionsRef, (snapshot) => {
+        state.sessions = [];
+        snapshot.forEach((doc) => state.sessions.push(doc.data()));
+        state.sessions.sort((a, b) => b.date.localeCompare(a.date));
+        updateSyncStatus('connected');
+        render();
+      }, (error) => {
+        console.error('同期エラー:', error);
+        updateSyncStatus('error');
+      });
+
+      unsubscribeSettings = onSnapshot(doc(db, 'groups', state.roomId, 'config', 'settings'), (doc) => {
+        if (doc.exists()) {
+          state.settings = { ...DEFAULT_SETTINGS, ...doc.data() };
+          if (state.currentSession.players.every(p => p === '' || p.startsWith('プレイヤー'))) {
+            state.currentSession.players = [...state.settings.players];
+          }
+          updateRoomIndicator();
+          render();
+        }
+      });
+    }
+
+    // 計算関数
+    function checkTotal(scores) {
+      return scores.reduce((a,b) => a+b, 0) === state.settings.totalPoint;
+    }
+
+    function getRanks(scores) {
+      const indexed = scores.map((s,i) => ({s,i}));
+      indexed.sort((a,b) => b.s - a.s);
+      const ranks = [0,0,0,0];
+      indexed.forEach((x,r) => ranks[x.i] = r + 1);
+      return ranks;
+    }
+
+    function calcGame(scores) {
+      if (!checkTotal(scores)) return null;
+      const ranks = getRanks(scores);
+      const oka = ((state.settings.basePoint - state.settings.originPoint) * 4) / 1000;
+      const results = scores.map((score, i) => {
+        const base = (score - state.settings.basePoint) / 1000;
+        const uma = state.settings.uma[ranks[i] - 1];
+        const okaBonus = ranks[i] === 1 ? oka : 0;
+        return base + uma + okaBonus;
+      });
+      return { ranks, results };
+    }
+
+    function calcSession(session) {
+      const totals = [0,0,0,0];
+      const rankCounts = [[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]];
+      session.games.forEach(g => {
+        const r = calcGame(g.scores);
+        if (r) {
+          r.results.forEach((v,i) => totals[i] += v);
+          r.ranks.forEach((v,i) => rankCounts[i][v-1]++);
+        }
+      });
+      return session.players.map((p,i) => ({
+        player: p || `P${i+1}`,
+        pointTotal: totals[i],
+        pointAmount: totals[i] * state.settings.pointCoef,
+        chipCount: session.chips[i],
+        chipAmount: session.chips[i] * state.settings.chipCoef,
+        total: totals[i] * state.settings.pointCoef + session.chips[i] * state.settings.chipCoef,
+        rankCounts: rankCounts[i],
+      }));
+    }
+
+    function getAllYakuman() {
+      const list = [];
+      state.sessions.forEach(session => {
+        session.games.forEach((game) => {
+          if (game.yakuman && game.yakuman.length > 0) {
+            game.yakuman.forEach(yk => list.push({ date: session.date, ...yk }));
+          }
+        });
+      });
+      return list.sort((a,b) => b.date.localeCompare(a.date));
+    }
+
+    function getYakumanStats() {
+      const stats = {};
+      state.settings.players.forEach(p => stats[p] = { count: 0 });
+      getAllYakuman().forEach(yk => {
+        if (stats[yk.player]) stats[yk.player].count++;
+      });
+      return stats;
+    }
+
+    function getPlayerStats() {
+      const stats = {};
+      state.sessions.forEach(session => {
+        session.games.forEach(game => {
+          const r = calcGame(game.scores);
+          if (!r) return;
+          session.players.forEach((player, i) => {
+            if (!player) return;
+            if (!stats[player]) {
+              stats[player] = { name: player, games: 0, ranks: [0,0,0,0], totalPoints: 0, totalChips: 0 };
+            }
+            stats[player].games++;
+            stats[player].ranks[r.ranks[i] - 1]++;
+            stats[player].totalPoints += r.results[i];
+          });
+        });
+        session.players.forEach((player, i) => {
+          if (player && stats[player]) stats[player].totalChips += session.chips[i];
+        });
+      });
+
+      const yakumanStats = getYakumanStats();
+      Object.values(stats).forEach(s => {
+        s.winRate = s.games > 0 ? ((s.ranks[0] / s.games) * 100).toFixed(1) : 0;
+        s.avgRank = s.games > 0 ? ((s.ranks[0]*1 + s.ranks[1]*2 + s.ranks[2]*3 + s.ranks[3]*4) / s.games).toFixed(2) : 0;
+        s.totalAmount = s.totalPoints * state.settings.pointCoef + s.totalChips * state.settings.chipCoef;
+        s.yakumanCount = yakumanStats[s.name] ? yakumanStats[s.name].count : 0;
+      });
+
+      return Object.values(stats).sort((a,b) => b.totalAmount - a.totalAmount);
+    }
+
+    // UI
+    function render() {
+      if (!state.roomId) {
+        showLoginScreen();
+        return;
+      }
+      
+      const app = document.getElementById('app');
+      app.innerHTML = `
+        <h1 class="text-xl font-bold text-white text-center mb-3">🀄 麻雀精算</h1>
+        <div class="grid grid-cols-6 gap-1 mb-4">
+          ${['input:📝入力', 'history:📚履歴', 'report:📊成績', 'yakuman:🀄役満', 'ranking:🏆順位', 'data:💾管理'].map(t => {
+            const [id, label] = t.split(':');
+            return `<button onclick="setTab('${id}')" class="tab-btn py-3 rounded text-sm text-center ${state.activeTab === id ? 'bg-yellow-600 text-white' : 'bg-gray-700 text-gray-300'}">${label}</button>`;
+          }).join('')}
+        </div>
+        <div id="content"></div>
+      `;
+      const content = document.getElementById('content');
+      if (state.activeTab === 'input') renderInput(content);
+      else if (state.activeTab === 'history') renderHistory(content);
+      else if (state.activeTab === 'report') renderReport(content);
+      else if (state.activeTab === 'yakuman') renderYakuman(content);
+      else if (state.activeTab === 'ranking') renderRanking(content);
+      else if (state.activeTab === 'data') renderData(content);
+    }
+
+    window.setTab = (tab) => { state.activeTab = tab; render(); };
+
+    function renderInput(el) {
+      const cs = state.currentSession;
+      const chipTotal = cs.chips.reduce((a,b) => a+b, 0);
+      const chipValid = chipTotal === 0;
+
+      el.innerHTML = `
+        <div class="flex justify-end mb-2">
+          <button onclick="toggleSettings()" class="bg-yellow-600 text-white px-3 py-1 rounded text-sm">⚙️設定</button>
+        </div>
+        ${state.showSettings ? `
+        <div class="bg-gray-800 rounded-lg p-3 mb-3">
+          <div class="mb-3">
+            <label class="text-gray-300 text-xs">部屋名</label>
+            <input type="text" value="${state.settings.roomName || ''}" onchange="updateSetting('roomName', this.value)" class="w-full p-2 rounded bg-gray-700 text-white" placeholder="表示用の部屋名">
+          </div>
+          <div class="mb-3">
+            <label class="text-gray-300 text-xs">デフォルトプレイヤー</label>
+            <div class="grid grid-cols-2 gap-2 mt-1">
+              ${state.settings.players.map((p,i) => `<input value="${p}" onchange="updatePlayerSetting(${i}, this.value)" placeholder="プレイヤー${i+1}" class="p-2 rounded bg-gray-700 text-white text-sm">`).join('')}
+            </div>
+          </div>
+          <div class="grid grid-cols-2 gap-2 text-sm">
+            <div><label class="text-gray-300 text-xs">基準点</label><input type="number" value="${state.settings.basePoint}" onchange="updateSetting('basePoint', this.value)" class="w-full p-2 rounded bg-gray-700 text-white score-input"></div>
+            <div><label class="text-gray-300 text-xs">合計点</label><input type="number" value="${state.settings.totalPoint}" onchange="updateSetting('totalPoint', this.value)" class="w-full p-2 rounded bg-gray-700 text-white score-input"></div>
+            <div><label class="text-gray-300 text-xs">点数係数</label><input type="number" value="${state.settings.pointCoef}" onchange="updateSetting('pointCoef', this.value)" class="w-full p-2 rounded bg-gray-700 text-white score-input"></div>
+            <div><label class="text-gray-300 text-xs">チップ係数</label><input type="number" value="${state.settings.chipCoef}" onchange="updateSetting('chipCoef', this.value)" class="w-full p-2 rounded bg-gray-700 text-white score-input"></div>
+          </div>
+          <div class="mt-2">
+            <label class="text-gray-300 text-xs">ウマ</label>
+            <div class="grid grid-cols-4 gap-1">
+              ${state.settings.uma.map((u,i) => `<input type="number" value="${u}" onchange="updateUma(${i}, this.value)" class="p-1 rounded bg-gray-700 text-white text-center text-sm score-input">`).join('')}
+            </div>
+          </div>
+        </div>
+        ` : ''}
+        <div class="bg-gray-800 rounded-lg p-3 mb-3">
+          <input type="date" value="${cs.date}" onchange="updateDate(this.value)" class="w-full p-2 rounded bg-gray-700 text-white mb-2">
+          <div class="grid grid-cols-4 gap-1">
+            ${cs.players.map((p,i) => `<input value="${p}" onchange="updatePlayer(${i}, this.value)" placeholder="氏名${i+1}" class="p-2 rounded bg-gray-700 text-white text-sm">`).join('')}
+          </div>
+        </div>
+        <div class="bg-gray-800 rounded-lg p-3 mb-3">
+          <div class="flex justify-between items-center mb-2">
+            <span class="text-white font-bold text-sm">ゲーム</span>
+            <button onclick="addGame()" class="bg-blue-600 text-white px-3 py-1 rounded text-sm">+追加</button>
+          </div>
+          ${cs.games.length === 0 ? '<p class="text-gray-400 text-center py-4 text-sm">ゲームを追加してください</p>' : 
+            cs.games.map((g,gi) => {
+              const valid = checkTotal(g.scores);
+              const result = calcGame(g.scores);
+              const total = g.scores.reduce((a,b) => a+b, 0);
+              const yakumanList = g.yakuman || [];
+              return `
+              <div class="p-2 rounded mb-2 ${valid ? 'bg-gray-700' : 'bg-red-900'}">
+                <div class="flex justify-between items-center mb-1">
+                  <span class="text-white text-base">#${gi+1}</span>
+                  <div class="flex items-center gap-2">
+                    <span class="text-sm ${valid ? 'text-green-400' : 'text-red-400'}">計:${(total/100).toLocaleString()}</span>
+                    <button onclick="removeGame(${gi})" class="text-red-400 text-sm">✕</button>
+                  </div>
+                </div>
+                <div class="grid grid-cols-4 gap-1 mb-2">
+                  ${g.scores.map((s,pi) => `
+                    <div>
+                      <div class="text-gray-300 text-xs text-center mb-1 truncate">${cs.players[pi] || 'P'+(pi+1)}</div>
+                      <input type="number" value="${s ? s/100 : ''}" onchange="updateScore(${gi},${pi},this.value)" placeholder="250" class="w-full p-2 rounded bg-gray-600 text-white text-center text-base score-input">
+                      ${result ? `<div class="text-sm text-center mt-1"><span class="text-yellow-400">${result.ranks[pi]}位</span> <span class="${result.results[pi]>=0?'text-green-400':'text-red-400'}">${result.results[pi]>=0?'+':''}${result.results[pi]}</span></div>` : ''}
+                    </div>
+                  `).join('')}
+                </div>
+                <div class="border-t border-gray-600 pt-2 mt-2">
+                  <div class="flex justify-between items-center mb-1">
+                    <span class="text-yellow-400 text-xs font-bold">🀄 役満</span>
+                    <button onclick="addYakuman(${gi})" class="bg-yellow-600 text-white px-2 py-0.5 rounded text-xs">+追加</button>
+                  </div>
+                  ${yakumanList.map((yk, yi) => `
+                    <div class="bg-gray-600 rounded p-2 mb-1 text-xs">
+                      <div class="flex justify-between items-center">
+                        <span class="text-yellow-300 font-bold">${yk.yaku}</span>
+                        <button onclick="removeYakuman(${gi},${yi})" class="text-red-400">✕</button>
+                      </div>
+                      <div class="text-gray-300">${yk.player} / ${yk.type}${yk.type === 'ロン' && yk.from ? ` ← ${yk.from}` : ''}</div>
+                    </div>
+                  `).join('')}
+                </div>
+                <button onclick="saveGame(${gi})" class="w-full mt-2 ${valid ? 'bg-green-600' : 'bg-gray-500'} text-white py-2 rounded font-bold text-sm">${valid ? '💾 このゲームを保存' : '⚠️ 合計が不正です'}</button>
+              </div>`;
+            }).join('')}
+        </div>
+        <div class="rounded-lg p-3 mb-3 ${chipValid ? 'bg-gray-800' : 'bg-red-900'}">
+          <div class="flex justify-between items-center mb-2">
+            <span class="text-white font-bold text-sm">チップ</span>
+            <span class="text-xs ${chipValid ? 'text-green-400' : 'text-red-400'}">計:${chipTotal}</span>
+          </div>
+          <div class="grid grid-cols-4 gap-1">
+            ${cs.chips.map((c,i) => `
+              <div>
+                <div class="text-gray-300 text-sm text-center mb-1 truncate">${cs.players[i] || 'P'+(i+1)}</div>
+                <input type="number" value="${c||''}" onchange="updateChip(${i},this.value)" placeholder="0" class="p-2 rounded bg-gray-700 text-white text-center text-base score-input w-full">
+              </div>
+            `).join('')}
+          </div>
+        </div>
+        ${cs.games.length > 0 ? `
+        <div class="bg-gray-800 rounded-lg p-3 mb-3 overflow-x-auto">
+          <table class="w-full text-white text-xs">
+            <thead><tr class="border-b border-gray-600">
+              <th class="text-left p-1">名前</th><th class="text-right p-1">pt</th><th class="text-right p-1">円</th><th class="text-right p-1">chip</th><th class="text-right p-1">計</th>
+            </tr></thead>
+            <tbody>
+              ${calcSession(cs).map(r => `
+                <tr class="border-b border-gray-700">
+                  <td class="p-1">${r.player}</td>
+                  <td class="text-right p-1 ${r.pointTotal>=0?'text-green-400':'text-red-400'}">${r.pointTotal}</td>
+                  <td class="text-right p-1 ${r.pointAmount>=0?'text-green-400':'text-red-400'}">${r.pointAmount.toLocaleString()}</td>
+                  <td class="text-right p-1 ${r.chipAmount>=0?'text-green-400':'text-red-400'}">${r.chipAmount.toLocaleString()}</td>
+                  <td class="text-right p-1 font-bold ${r.total>=0?'text-green-400':'text-red-400'}">${r.total.toLocaleString()}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+        ` : ''}
+        <button onclick="saveSession()" class="w-full bg-green-600 text-white py-3 rounded-lg font-bold">💾 保存</button>
+      `;
+    }
+
+    window.toggleSettings = () => { state.showSettings = !state.showSettings; render(); };
+    window.updateSetting = (key, val) => { 
+      if (key === 'roomName') {
+        state.settings[key] = val;
+      } else {
+        state.settings[key] = parseInt(val) || 0;
+      }
+      saveSettingsToFirebase(); 
+      render(); 
+    };
+    window.updatePlayerSetting = (i, val) => {
+      state.settings.players[i] = val;
+      saveSettingsToFirebase();
+      render();
+    };
+    window.updateUma = (i, val) => { state.settings.uma[i] = parseInt(val) || 0; saveSettingsToFirebase(); render(); };
+    window.updateDate = (val) => { state.currentSession.date = val; render(); };
+    window.updatePlayer = (i, val) => { state.currentSession.players[i] = val; render(); };
+    window.addGame = () => { state.currentSession.games.push({scores:[0,0,0,0], yakuman: []}); render(); };
+    window.removeGame = (i) => { state.currentSession.games.splice(i,1); render(); };
+    window.updateScore = (gi, pi, val) => { state.currentSession.games[gi].scores[pi] = (parseInt(val)||0) * 100; render(); };
+    window.updateChip = (i, val) => { state.currentSession.chips[i] = parseInt(val)||0; render(); };
+
+    window.saveGame = async (gi) => {
+      const game = state.currentSession.games[gi];
+      if (!checkTotal(game.scores)) {
+        alert('合計が' + state.settings.totalPoint + '点になっていません');
+        return;
+      }
+      const cs = state.currentSession;
+      const toSave = { ...cs, id: cs.date, savedAt: new Date().toISOString() };
+      await saveSessionToFirebase(toSave);
+      alert('保存しました！');
+      render();
+    };
+
+    window.addYakuman = (gi) => {
+      const players = state.currentSession.players;
+      document.body.insertAdjacentHTML('beforeend', `
+        <div id="yakumanModal" class="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50 p-4">
+          <div class="bg-gray-800 rounded-lg p-4 w-full max-w-sm">
+            <h3 class="text-white font-bold mb-3">🀄 役満を追加</h3>
+            <div class="mb-3">
+              <label class="text-gray-300 text-sm">和了者</label>
+              <select id="yk_player" class="w-full p-2 rounded bg-gray-700 text-white">
+                ${players.map(p => `<option value="${p}">${p}</option>`).join('')}
+              </select>
+            </div>
+            <div class="mb-3">
+              <label class="text-gray-300 text-sm">役名</label>
+              <select id="yk_yaku" class="w-full p-2 rounded bg-gray-700 text-white" onchange="document.getElementById('yk_yaku_other').classList.toggle('hidden', this.value !== 'その他')">
+                ${YAKUMAN_LIST.map(y => `<option value="${y}">${y}</option>`).join('')}
+              </select>
+              <input id="yk_yaku_other" type="text" placeholder="その他の役名" class="w-full p-2 rounded bg-gray-700 text-white mt-1 hidden">
+            </div>
+            <div class="mb-3">
+              <label class="text-gray-300 text-sm">ツモ/ロン</label>
+              <select id="yk_type" class="w-full p-2 rounded bg-gray-700 text-white" onchange="document.getElementById('yk_from_div').classList.toggle('hidden', this.value !== 'ロン')">
+                <option value="ツモ">ツモ</option>
+                <option value="ロン">ロン</option>
+              </select>
+            </div>
+            <div id="yk_from_div" class="mb-3 hidden">
+              <label class="text-gray-300 text-sm">放銃者</label>
+              <select id="yk_from" class="w-full p-2 rounded bg-gray-700 text-white">
+                ${players.map(p => `<option value="${p}">${p}</option>`).join('')}
+              </select>
+            </div>
+            <div class="flex gap-2">
+              <button onclick="confirmYakuman(${gi})" class="flex-1 bg-yellow-600 text-white py-2 rounded font-bold">追加</button>
+              <button onclick="document.getElementById('yakumanModal').remove()" class="flex-1 bg-gray-600 text-white py-2 rounded">キャンセル</button>
+            </div>
+          </div>
+        </div>
+      `);
+    };
+
+    window.confirmYakuman = (gi) => {
+      let yaku = document.getElementById('yk_yaku').value;
+      if (yaku === 'その他') yaku = document.getElementById('yk_yaku_other').value || 'その他';
+      const type = document.getElementById('yk_type').value;
+      const from = type === 'ロン' ? document.getElementById('yk_from').value : null;
+      if (!state.currentSession.games[gi].yakuman) state.currentSession.games[gi].yakuman = [];
+      state.currentSession.games[gi].yakuman.push({
+        player: document.getElementById('yk_player').value,
+        yaku, type, from
+      });
+      document.getElementById('yakumanModal').remove();
+      render();
+    };
+
+    window.removeYakuman = (gi, yi) => { state.currentSession.games[gi].yakuman.splice(yi, 1); render(); };
+
+    window.saveSession = async () => {
+      const cs = state.currentSession;
+      if (cs.games.length === 0) { alert('ゲームを追加してください'); return; }
+      if (cs.games.filter(g => checkTotal(g.scores)).length === 0) { alert('有効なゲームがありません'); return; }
+      const toSave = { ...cs, id: cs.date, savedAt: new Date().toISOString() };
+      await saveSessionToFirebase(toSave);
+      state.currentSession = { id: null, date: new Date().toISOString().split('T')[0], players: [...state.settings.players], games: [], chips: [0,0,0,0] };
+      alert('保存しました！');
+      render();
+    };
+
+    function renderHistory(el) {
+      if (state.sessions.length === 0) { el.innerHTML = '<p class="text-gray-400 text-center py-8">履歴なし</p>'; return; }
+      el.innerHTML = [...state.sessions].sort((a,b) => b.date.localeCompare(a.date)).map(s => {
+        const results = calcSession(s);
+        const ykCount = s.games.reduce((sum, g) => sum + (g.yakuman ? g.yakuman.length : 0), 0);
+        return `
+        <div class="bg-gray-800 rounded-lg p-3 mb-3">
+          <div class="flex justify-between items-center mb-2">
+            <div><span class="text-white font-bold">${s.date}</span>${ykCount > 0 ? `<span class="ml-2 bg-yellow-600 text-white px-2 py-0.5 rounded text-xs">役満${ykCount}</span>` : ''}</div>
+            <button onclick="editSession('${s.id}')" class="bg-blue-600 text-white px-3 py-1 rounded text-sm">編集</button>
+          </div>
+          <div class="grid grid-cols-2 gap-2 mb-2">
+            ${results.map(r => `<div class="bg-gray-700 rounded p-2"><div class="text-gray-300 text-sm">${r.player}</div><div class="font-bold ${r.total>=0?'text-green-400':'text-red-400'}">${r.total>=0?'+':''}${r.total.toLocaleString()}円</div></div>`).join('')}
+          </div>
+          <div class="text-right">
+            <button onclick="deleteSession('${s.id}')" class="text-red-400 text-sm">🗑️ 削除</button>
+          </div>
+        </div>`;
+      }).join('');
+    }
+
+    window.editSession = (id) => {
+      const s = state.sessions.find(x => String(x.id) === String(id));
+      if (s) { state.currentSession = JSON.parse(JSON.stringify(s)); state.activeTab = 'input'; render(); }
+    };
+    window.deleteSession = async (id) => { if (confirm('削除しますか？')) await deleteSessionFromFirebase(id); };
+
+    function renderReport(el) {
+      const stats = getPlayerStats();
+      el.innerHTML = `
+        <div class="bg-gray-800 rounded-lg p-3 mb-3 overflow-x-auto">
+          <table class="w-full text-white text-xs">
+            <thead><tr class="border-b border-gray-600"><th class="text-left p-1">名前</th><th class="text-right p-1">局数</th><th class="text-right p-1">勝率</th><th class="text-right p-1">平順</th><th class="text-right p-1">役満</th><th class="text-right p-1">収支</th></tr></thead>
+            <tbody>${stats.map(s => `<tr class="border-b border-gray-700"><td class="p-1">${s.name}</td><td class="text-right p-1">${s.games}</td><td class="text-right p-1">${s.winRate}%</td><td class="text-right p-1">${s.avgRank}</td><td class="text-right p-1 text-yellow-400">${s.yakumanCount}</td><td class="text-right p-1 font-bold ${s.totalAmount>=0?'text-green-400':'text-red-400'}">${s.totalAmount.toLocaleString()}</td></tr>`).join('')}</tbody>
+          </table>
+        </div>
+        <div class="bg-gray-800 rounded-lg p-3">
+          <h3 class="text-white font-bold mb-2 text-sm">順位分布</h3>
+          ${stats.map(s => `<div class="mb-2"><div class="text-gray-300 text-xs mb-1">${s.name}</div><div class="flex gap-1"><span class="bg-yellow-600 text-white px-2 py-1 rounded text-xs">1位:${s.ranks[0]}</span><span class="bg-gray-500 text-white px-2 py-1 rounded text-xs">2位:${s.ranks[1]}</span><span class="bg-orange-700 text-white px-2 py-1 rounded text-xs">3位:${s.ranks[2]}</span><span class="bg-gray-700 text-white px-2 py-1 rounded text-xs">4位:${s.ranks[3]}</span></div></div>`).join('')}
+        </div>
+      `;
+    }
+
+    function renderYakuman(el) {
+      const all = getAllYakuman();
+      const stats = getYakumanStats();
+      el.innerHTML = `
+        <div class="bg-gray-800 rounded-lg p-3 mb-3">
+          <h3 class="text-white font-bold mb-2">🀄 役満回数</h3>
+          <div class="grid grid-cols-2 gap-2">
+            ${Object.entries(stats).map(([name, data]) => `<div class="bg-gray-700 rounded p-2 text-center"><div class="text-gray-300 text-sm">${name}</div><div class="text-yellow-400 text-2xl font-bold">${data.count}</div></div>`).join('')}
+          </div>
+        </div>
+        <div class="bg-gray-800 rounded-lg p-3">
+          <h3 class="text-white font-bold mb-2">📜 役満履歴</h3>
+          ${all.length === 0 ? '<p class="text-gray-400 text-center py-4 text-sm">役満記録なし</p>' : all.map(yk => `<div class="bg-gray-700 rounded p-2 mb-2"><div class="flex justify-between items-center"><span class="text-yellow-400 font-bold">${yk.yaku}</span><span class="text-gray-400 text-xs">${yk.date}</span></div><div class="text-gray-300 text-sm">${yk.player} / ${yk.type}${yk.type === 'ロン' && yk.from ? ` ← ${yk.from}` : ''}</div></div>`).join('')}
+        </div>
+      `;
+    }
+
+    function renderRanking(el) {
+      const stats = getPlayerStats();
+      const medal = (i) => i===0?'🥇':i===1?'🥈':i===2?'🥉':i===3?'4️⃣':`${i+1}.`;
+      el.innerHTML = `
+        <div class="bg-gray-800 rounded-lg p-3 mb-3"><h3 class="text-white font-bold mb-2">💰 収支</h3>${stats.map((s,i) => `<div class="flex justify-between py-1 border-b border-gray-700"><span class="text-white">${medal(i)} ${s.name}</span><span class="${s.totalAmount>=0?'text-green-400':'text-red-400'}">${s.totalAmount.toLocaleString()}円</span></div>`).join('')}</div>
+        <div class="bg-gray-800 rounded-lg p-3 mb-3"><h3 class="text-white font-bold mb-2">🎯 勝率</h3>${[...stats].sort((a,b) => b.winRate - a.winRate).map((s,i) => `<div class="flex justify-between py-1 border-b border-gray-700"><span class="text-white">${medal(i)} ${s.name}</span><span class="text-yellow-400">${s.winRate}%</span></div>`).join('')}</div>
+        <div class="bg-gray-800 rounded-lg p-3 mb-3"><h3 class="text-white font-bold mb-2">🀄 役満</h3>${[...stats].sort((a,b) => b.yakumanCount - a.yakumanCount).map((s,i) => `<div class="flex justify-between py-1 border-b border-gray-700"><span class="text-white">${medal(i)} ${s.name}</span><span class="text-yellow-400">${s.yakumanCount}回</span></div>`).join('')}</div>
+        <div class="bg-gray-800 rounded-lg p-3"><h3 class="text-white font-bold mb-2">📊 平均順位</h3>${[...stats].sort((a,b) => a.avgRank - b.avgRank).map((s,i) => `<div class="flex justify-between py-1 border-b border-gray-700"><span class="text-white">${medal(i)} ${s.name}</span><span class="text-blue-400">${s.avgRank}</span></div>`).join('')}</div>
+      `;
+    }
+
+    function renderData(el) {
+      el.innerHTML = `
+        <div class="bg-gray-800 rounded-lg p-4 mb-3">
+          <h3 class="text-white font-bold mb-2">🏠 部屋情報</h3>
+          <p class="text-gray-300 text-sm">部屋ID: <span class="text-yellow-400 font-mono">${state.roomId}</span></p>
+          <p class="text-gray-400 text-xs mt-1">このIDとパスワードを仲間に共有してください</p>
+        </div>
+        <div class="bg-gray-800 rounded-lg p-4 mb-3">
+          <h3 class="text-white font-bold mb-2">📈 統計</h3>
+          <div class="grid grid-cols-3 gap-2 text-center">
+            <div class="bg-gray-700 rounded p-2"><div class="text-2xl font-bold text-white">${state.sessions.length}</div><div class="text-gray-400 text-xs">セッション</div></div>
+            <div class="bg-gray-700 rounded p-2"><div class="text-2xl font-bold text-white">${state.sessions.reduce((s,x) => s + x.games.length, 0)}</div><div class="text-gray-400 text-xs">ゲーム</div></div>
+            <div class="bg-gray-700 rounded p-2"><div class="text-2xl font-bold text-yellow-400">${getAllYakuman().length}</div><div class="text-gray-400 text-xs">役満</div></div>
+          </div>
+        </div>
+        <div class="bg-gray-800 rounded-lg p-4 mb-3">
+          <h3 class="text-white font-bold mb-2">📤 エクスポート</h3>
+          <button onclick="exportData()" class="w-full bg-blue-600 text-white py-2 rounded">JSONでバックアップ</button>
+        </div>
+        <div class="bg-gray-800 rounded-lg p-4 mb-3">
+          <h3 class="text-white font-bold mb-2">📥 インポート</h3>
+          <label class="block w-full bg-green-600 text-white py-2 rounded text-center cursor-pointer mb-2">JSONから復元<input type="file" accept=".json" onchange="importJSON(event)" class="hidden"></label>
+          <div id="importJSONPreview"></div>
+        </div>
+        <div class="bg-gray-800 rounded-lg p-4 mb-3">
+          <h3 class="text-white font-bold mb-2">📋 過去データ（Excel/CSV）</h3>
+          <p class="text-gray-400 text-xs mb-2">プレイヤー: ${state.settings.players.join(', ')}</p>
+          <label class="block w-full bg-purple-600 text-white py-2 rounded text-center cursor-pointer mb-2">点数データ読込<input type="file" accept=".xlsx,.xls,.csv" onchange="importLegacy(event)" class="hidden"></label>
+          <label class="block w-full bg-orange-600 text-white py-2 rounded text-center cursor-pointer">チップデータ読込<input type="file" accept=".xlsx,.xls,.csv" onchange="importChip(event)" class="hidden"></label>
+          <div id="importPreview"></div>
+        </div>
+        <div class="bg-gray-800 rounded-lg p-4 mb-3">
+          <h3 class="text-white font-bold mb-2">🔑 パスワード変更</h3>
+          <button onclick="showChangePassword()" class="w-full bg-yellow-600 text-white py-2 rounded">パスワードを変更</button>
+        </div>
+        <div class="bg-gray-800 rounded-lg p-4 mb-3">
+          <h3 class="text-white font-bold mb-2">⚠️ データ削除</h3>
+          <p class="text-gray-400 text-xs mb-2">この部屋の全データを削除します</p>
+          <button onclick="deleteAllData()" class="w-full bg-red-600 text-white py-2 rounded">🗑️ 全データ削除</button>
+        </div>
+      `;
+    }
+
+    window.showChangePassword = () => {
+      document.body.insertAdjacentHTML('beforeend', `
+        <div id="passwordModal" class="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50 p-4">
+          <div class="bg-gray-800 rounded-lg p-4 w-full max-w-sm">
+            <h3 class="text-white font-bold mb-3">🔑 パスワード変更</h3>
+            <div class="mb-3">
+              <label class="text-gray-300 text-sm">新しいパスワード</label>
+              <input id="newPw" type="password" class="w-full p-2 rounded bg-gray-700 text-white mt-1">
+            </div>
+            <div class="mb-3">
+              <label class="text-gray-300 text-sm">パスワード確認</label>
+              <input id="newPwConfirm" type="password" class="w-full p-2 rounded bg-gray-700 text-white mt-1">
+            </div>
+            <div class="flex gap-2">
+              <button onclick="changePassword()" class="flex-1 bg-green-600 text-white py-2 rounded font-bold">変更</button>
+              <button onclick="document.getElementById('passwordModal').remove()" class="flex-1 bg-gray-600 text-white py-2 rounded">キャンセル</button>
+            </div>
+          </div>
+        </div>
+      `);
+    };
+
+    window.changePassword = async () => {
+      const newPw = document.getElementById('newPw').value;
+      const newPwConfirm = document.getElementById('newPwConfirm').value;
+      if (!newPw || newPw.length < 4) { alert('パスワードは4文字以上にしてください'); return; }
+      if (newPw !== newPwConfirm) { alert('パスワードが一致しません'); return; }
+      
+      try {
+        const hashedPassword = await hashPassword(newPw);
+        await setDoc(doc(db, 'groups', state.roomId, 'config', 'auth'), {
+          passwordHash: hashedPassword,
+          updatedAt: new Date().toISOString()
+        }, { merge: true });
+        saveRoomAuth(state.roomId, hashedPassword);
+        document.getElementById('passwordModal').remove();
+        alert('パスワードを変更しました');
+      } catch (error) {
+        alert('エラー: ' + error.message);
+      }
+    };
+
+    window.exportData = () => {
+      const data = { roomId: state.roomId, sessions: state.sessions, settings: state.settings };
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+      a.download = `mahjong_${state.roomId}_${new Date().toISOString().split('T')[0]}.json`; a.click();
+    };
+
+    let pendingJSONImport = null;
+
+    window.importJSON = (e) => {
+      const file = e.target.files[0]; if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        try {
+          const data = JSON.parse(ev.target.result);
+          if (!data.sessions || !Array.isArray(data.sessions)) {
+            alert('無効なJSONファイルです'); return;
+          }
+          pendingJSONImport = data;
+          document.getElementById('importJSONPreview').innerHTML = `
+            <div class="mt-3 bg-green-900 rounded p-3">
+              <p class="text-white text-sm font-bold">📥 復元データ</p>
+              <p class="text-white text-sm">${data.sessions.length}セッション</p>
+              ${data.settings ? '<p class="text-white text-sm">設定も復元します</p>' : ''}
+              <div class="flex gap-2 mt-2">
+                <button onclick="confirmJSONImport()" class="bg-green-600 text-white px-3 py-1 rounded text-sm">実行</button>
+                <button onclick="cancelJSONImport()" class="bg-gray-600 text-white px-3 py-1 rounded text-sm">取消</button>
+              </div>
+            </div>`;
+        } catch(err) { alert('JSONの読み込みエラー: ' + err.message); }
+      };
+      reader.readAsText(file); e.target.value = '';
+    };
+
+    window.confirmJSONImport = async () => {
+      if (!pendingJSONImport) return;
+      updateSyncStatus('syncing');
+      try {
+        // 設定を復元
+        if (pendingJSONImport.settings) {
+          await setDoc(doc(db, 'groups', state.roomId, 'config', 'settings'), pendingJSONImport.settings);
+        }
+        // セッションを復元
+        const batchSize = 500;
+        for (let i = 0; i < pendingJSONImport.sessions.length; i += batchSize) {
+          const batch = writeBatch(db);
+          pendingJSONImport.sessions.slice(i, i + batchSize).forEach(s => {
+            batch.set(doc(db, 'groups', state.roomId, 'sessions', String(s.id || s.date)), s);
+          });
+          await batch.commit();
+        }
+        updateSyncStatus('connected');
+        alert(`${pendingJSONImport.sessions.length}セッションを復元しました！`);
+      } catch (error) {
+        alert('エラー: ' + error.message);
+        updateSyncStatus('error');
+      }
+      pendingJSONImport = null;
+      document.getElementById('importJSONPreview').innerHTML = '';
+    };
+
+    window.cancelJSONImport = () => {
+      pendingJSONImport = null;
+      document.getElementById('importJSONPreview').innerHTML = '';
+    };
+
+    let pendingImport = null;
+    let pendingChipImport = null;
+
+    window.importLegacy = (e) => {
+      const file = e.target.files[0]; if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        try {
+          const wb = XLSX.read(new Uint8Array(ev.target.result), { type: 'array' });
+          const json = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+          processLegacyData(json);
+        } catch(err) { alert('読み込みエラー: ' + err.message); }
+      };
+      reader.readAsArrayBuffer(file); e.target.value = '';
+    };
+
+    function processLegacyData(data) {
+      if (!data || !data.length) { alert('データなし'); return; }
+      const playerCols = state.settings.players;
+      const keys = Object.keys(data[0]);
+      const missing = playerCols.filter(p => !keys.includes(p));
+      if (missing.length) { alert(`列が見つかりません: ${missing.join(', ')}\n検出: ${keys.join(', ')}`); return; }
+      
+      let dateCol = '日付';
+      if (!keys.includes(dateCol)) dateCol = keys[0];
+      
+      const sessionMap = {}; let count = 0;
+      data.forEach(row => {
+        let dateVal = row[dateCol]; if (!dateVal) return;
+        let dateStr;
+        if (typeof dateVal === 'number' || (!isNaN(dateVal) && parseInt(dateVal) > 40000)) {
+          const d = new Date(new Date(1899, 11, 30).getTime() + parseInt(dateVal) * 86400000);
+          dateStr = d.toISOString().split('T')[0];
+        } else {
+          const str = String(dateVal);
+          if (str.includes('/')) {
+            const parts = str.split('/');
+            dateStr = `${parts[0]}-${parts[1].padStart(2, '0')}-${parts[2].padStart(2, '0')}`;
+          } else dateStr = str;
+        }
+        if (!sessionMap[dateStr]) sessionMap[dateStr] = { date: dateStr, players: playerCols, games: [], chips: [0,0,0,0] };
+        sessionMap[dateStr].games.push({ scores: playerCols.map(p => parseInt(row[p]) || 0), yakuman: [] });
+        count++;
+      });
+      const sessions = Object.values(sessionMap).map((s) => ({ ...s, id: s.date, savedAt: new Date().toISOString() }));
+      if (!sessions.length) { alert('有効データなし'); return; }
+      const dates = Object.keys(sessionMap).sort();
+      pendingImport = sessions;
+      document.getElementById('importPreview').innerHTML = `
+        <div class="mt-3 bg-gray-700 rounded p-3">
+          <p class="text-white text-sm">${sessions.length}日 / ${count}ゲーム</p>
+          <p class="text-white text-sm">${dates[0]} 〜 ${dates[dates.length-1]}</p>
+          <div class="flex gap-2 mt-2">
+            <button onclick="confirmImport()" class="bg-green-600 text-white px-3 py-1 rounded text-sm">実行</button>
+            <button onclick="cancelImport()" class="bg-gray-600 text-white px-3 py-1 rounded text-sm">取消</button>
+          </div>
+        </div>`;
+    }
+
+    window.confirmImport = async () => {
+      if (!pendingImport) return;
+      updateSyncStatus('syncing');
+      try {
+        const batchSize = 500;
+        for (let i = 0; i < pendingImport.length; i += batchSize) {
+          const batch = writeBatch(db);
+          pendingImport.slice(i, i + batchSize).forEach(s => {
+            batch.set(doc(db, 'groups', state.roomId, 'sessions', String(s.id)), s);
+          });
+          await batch.commit();
+        }
+        updateSyncStatus('connected');
+        alert(`${pendingImport.length}セッションをインポートしました！`);
+      } catch (error) {
+        alert('エラー: ' + error.message);
+        updateSyncStatus('error');
+      }
+      pendingImport = null;
+      document.getElementById('importPreview').innerHTML = '';
+    };
+
+    window.cancelImport = () => { pendingImport = null; pendingChipImport = null; document.getElementById('importPreview').innerHTML = ''; };
+
+    window.importChip = (e) => {
+      const file = e.target.files[0]; if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        try {
+          const wb = XLSX.read(new Uint8Array(ev.target.result), { type: 'array' });
+          const json = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+          processChipData(json);
+        } catch(err) { alert('読み込みエラー: ' + err.message); }
+      };
+      reader.readAsArrayBuffer(file); e.target.value = '';
+    };
+
+    function processChipData(data) {
+      if (!data || !data.length) { alert('データなし'); return; }
+      const playerCols = state.settings.players;
+      const keys = Object.keys(data[0]);
+      const missing = playerCols.filter(p => !keys.includes(p));
+      if (missing.length) { alert(`列が見つかりません: ${missing.join(', ')}\n検出: ${keys.join(', ')}`); return; }
+      
+      let dateCol = '日付';
+      if (!keys.includes(dateCol)) dateCol = keys[0];
+      
+      const chipMap = {};
+      data.forEach(row => {
+        let dateVal = row[dateCol]; if (!dateVal) return;
+        let dateStr;
+        if (typeof dateVal === 'number' || (!isNaN(dateVal) && parseInt(dateVal) > 40000)) {
+          const d = new Date(new Date(1899, 11, 30).getTime() + parseInt(dateVal) * 86400000);
+          dateStr = d.toISOString().split('T')[0];
+        } else {
+          const str = String(dateVal);
+          if (str.includes('/')) {
+            const parts = str.split('/');
+            dateStr = `${parts[0]}-${parts[1].padStart(2, '0')}-${parts[2].padStart(2, '0')}`;
+          } else dateStr = str;
+        }
+        if (!chipMap[dateStr]) chipMap[dateStr] = [0, 0, 0, 0];
+        playerCols.forEach((p, i) => { chipMap[dateStr][i] += parseInt(row[p]) || 0; });
+      });
+      
+      const dates = Object.keys(chipMap).sort();
+      if (!dates.length) { alert('有効データなし'); return; }
+      pendingChipImport = chipMap;
+      document.getElementById('importPreview').innerHTML = `
+        <div class="mt-3 bg-orange-900 rounded p-3">
+          <p class="text-white text-sm font-bold">🎰 チップデータ</p>
+          <p class="text-white text-sm">${dates.length}日分</p>
+          <p class="text-white text-sm">${dates[0]} 〜 ${dates[dates.length-1]}</p>
+          <div class="flex gap-2 mt-2">
+            <button onclick="confirmChipImport()" class="bg-green-600 text-white px-3 py-1 rounded text-sm">実行</button>
+            <button onclick="cancelImport()" class="bg-gray-600 text-white px-3 py-1 rounded text-sm">取消</button>
+          </div>
+        </div>`;
+    }
+
+    window.confirmChipImport = async () => {
+      if (!pendingChipImport) return;
+      updateSyncStatus('syncing');
+      try {
+        let updatedCount = 0;
+        for (const [date, chips] of Object.entries(pendingChipImport)) {
+          const session = state.sessions.find(s => s.date === date);
+          if (session) {
+            session.chips = chips;
+            await saveSessionToFirebase(session);
+            updatedCount++;
+          }
+        }
+        updateSyncStatus('connected');
+        alert(`${updatedCount}件のチップデータを更新しました！`);
+      } catch (error) {
+        alert('エラー: ' + error.message);
+        updateSyncStatus('error');
+      }
+      pendingChipImport = null;
+      document.getElementById('importPreview').innerHTML = '';
+    };
+
+    window.deleteAllData = async () => {
+      if (!confirm('本当に全てのデータを削除しますか？')) return;
+      if (!confirm('最終確認：全データが削除されます。よろしいですか？')) return;
+      updateSyncStatus('syncing');
+      try {
+        const batch = writeBatch(db);
+        state.sessions.forEach(s => {
+          batch.delete(doc(db, 'groups', state.roomId, 'sessions', String(s.id)));
+        });
+        await batch.commit();
+        updateSyncStatus('connected');
+        alert('全データを削除しました');
+      } catch (error) {
+        alert('エラー: ' + error.message);
+        updateSyncStatus('error');
+      }
+    };
+
+    // 初期化
+    async function init() {
+      const savedRoomId = getSavedRoomId();
+      const savedAuthHash = getSavedAuthHash();
+      
+      if (!savedRoomId || !savedAuthHash) {
+        showLoginScreen();
+        return;
+      }
+      
+      // 保存済みの認証情報で自動ログイン
+      try {
+        const authDoc = await getDoc(doc(db, 'groups', savedRoomId, 'config', 'auth'));
+        if (authDoc.exists() && authDoc.data().passwordHash === savedAuthHash) {
+          state.roomId = savedRoomId;
+          document.getElementById('syncStatus').style.display = 'block';
+          startRealtimeSync();
+        } else {
+          clearSavedRoom();
+          showLoginScreen();
+        }
+      } catch (e) {
+        console.error('自動ログインエラー:', e);
+        showLoginScreen();
+      }
+    }
+
+    init();
+  </script>
+</body>
+</html>
